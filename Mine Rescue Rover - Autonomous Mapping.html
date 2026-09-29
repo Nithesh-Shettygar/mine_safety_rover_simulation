@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mine Rescue Rover - Autonomous Mapping</title>
+<style>
+:root{--bg:#0a101f;--panel:rgba(15,23,42,.92);--line:#1e293b;--tx:#e2e8f0;--mut:#94a3b8;--acc:#38bdf8;--warn:#f59e0b;--ok:#34d399;--bad:#f43f5e;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:12px ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
+#c{position:absolute;inset:0}
+#panel{position:absolute;top:8px;left:8px;width:270px;max-height:calc(100% - 16px);overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px}
+h1{font:700 12px system-ui,sans-serif;letter-spacing:.06em;margin:0 0 6px;color:var(--acc)}
+canvas#map{width:100%;aspect-ratio:1;background:#0b1220;border:1px solid var(--line);border-radius:6px;image-rendering:pixelated}
+.row{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid var(--line)}
+.row b{color:var(--warn)}
+#state{margin:6px 0;padding:6px;border-radius:6px;background:#0c4a6e;color:#e0f2fe;font-weight:700;text-align:center}
+#log{margin-top:6px;color:var(--ok);font-size:11px;line-height:1.35;max-height:110px;overflow:auto}
+#bar{position:absolute;top:8px;right:8px;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;max-width:60%}
+button{font:700 11px ui-monospace,monospace;color:var(--tx);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 10px;cursor:pointer}
+button.on{background:var(--acc);color:#0a101f}
+#alert{position:absolute;left:50%;top:14px;transform:translateX(-50%);background:rgba(127,29,29,.92);border:2px solid var(--bad);padding:8px 14px;border-radius:10px;font-weight:700;display:none;text-align:center}
+@media(max-width:640px){#panel{width:200px}#bar{max-width:55%}}
+</style>
+</head>
+<body>
+<div id="c"></div>
+<div id="alert"></div>
+<div id="panel">
+  <h1>MINE RESCUE ROVER &middot; JHK-09</h1>
+  <canvas id="map" width="231" height="231"></canvas>
+  <div id="state">INIT</div>
+  <div class="row"><span>Mission time</span><b id="t">00:00</b></div>
+  <div class="row"><span>Map coverage</span><b id="cov">0%</b></div>
+  <div class="row"><span>Rover cell</span><b id="pos">-</b></div>
+  <div class="row"><span>Survivor</span><b id="sv">searching</b></div>
+  <div class="row"><span>CH4 / CO</span><b id="gas">0.4% / 12ppm</b></div>
+  <div class="row"><span>Survivor HR / SpO2</span><b id="vit">-</b></div>
+  <div class="row"><span>Battery</span><b id="bat">100%</b></div>
+  <div id="log"></div>
+</div>
+<div id="bar">
+  <button id="bCam">CAM: CHASE</button>
+  <button id="bSp">SPEED 1x</button>
+  <button id="bLt" class="on">LIGHTS</button>
+  <button id="bSnd" class="on">SOUND</button>
+  <button id="bNew">NEW MISSION</button>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+"use strict";
+var W=21,H=21,CS=4,D=[[1,0],[-1,0],[0,1],[0,-1]];
+var wx=function(x){return (x-W/2+0.5)*CS},wz=function(y){return (y-H/2+0.5)*CS};
+function rng32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+
+/* ---------- audio ---------- */
+var actx=null,muted=false;
+function beep(f,d,ty){if(muted)return;try{if(!actx)actx=new(window.AudioContext||window.webkitAudioContext)();if(actx.state==='suspended')actx.resume();var o=actx.createOscillator(),g=actx.createGain();o.type=ty||'sine';o.frequency.value=f;g.gain.setValueAtTime(.06,actx.currentTime);g.gain.exponentialRampToValueAtTime(.001,actx.currentTime+d);o.connect(g);g.connect(actx.destination);o.start();o.stop(actx.currentTime+d)}catch(e){}}
+function chime(){[523,659,784,1046].forEach(function(f,i){setTimeout(function(){beep(f,.25,'triangle')},i*140)})}
+
+/* ---------- three setup ---------- */
+var box=document.getElementById('c');
+var scene=new THREE.Scene();scene.background=new THREE.Color(0x0a101f);scene.fog=new THREE.FogExp2(0x0a101f,0.012);
+var cam=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,.1,400);
+var rd=new THREE.WebGLRenderer({antialias:true});rd.setPixelRatio(Math.min(devicePixelRatio,2));rd.setSize(innerWidth,innerHeight);box.appendChild(rd.domElement);
+scene.add(new THREE.AmbientLight(0x8899aa,.75));scene.add(new THREE.HemisphereLight(0xffedd5,0x1e293b,.5));
+addEventListener('resize',function(){cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();rd.setSize(innerWidth,innerHeight)});
+
+function stdMat(c,o){return new THREE.MeshStandardMaterial(Object.assign({color:c},o||{}))}
+
+/* rover (faces +Z at yaw 0) */
+var rover=new THREE.Group();scene.add(rover);
+var ch=new THREE.Mesh(new THREE.BoxGeometry(2,.7,3.2),stdMat(0x1e293b,{metalness:.6,roughness:.4}));ch.position.y=.9;rover.add(ch);
+var pl=new THREE.Mesh(new THREE.BoxGeometry(1.7,.15,2.7),stdMat(0xe11d48));pl.position.y=1.3;rover.add(pl);
+var wheels=[];[[-1.2,1.1],[1.2,1.1],[-1.25,0],[1.25,0],[-1.2,-1.1],[1.2,-1.1]].forEach(function(p){
+  var pv=new THREE.Group();pv.position.set(p[0],.46,p[1]);
+  var w=new THREE.Mesh(new THREE.CylinderGeometry(.46,.46,.38,16),stdMat(0x020617));w.rotation.z=Math.PI/2;pv.add(w);
+  var h=new THREE.Mesh(new THREE.CylinderGeometry(.24,.24,.4,10),stdMat(0xf59e0b,{metalness:.8}));h.rotation.z=Math.PI/2;pv.add(h);
+  rover.add(pv);wheels.push(pv)});
+var lidar=new THREE.Mesh(new THREE.CylinderGeometry(.28,.28,.32,14),stdMat(0x0284c7,{metalness:.8}));lidar.position.set(0,1.7,-.5);rover.add(lidar);
+var fan=new THREE.Mesh(new THREE.RingGeometry(.5,7,32),new THREE.MeshBasicMaterial({color:0x38bdf8,side:THREE.DoubleSide,transparent:true,opacity:.18}));fan.rotation.x=Math.PI/2;fan.position.set(0,1.65,-.5);rover.add(fan);
+var arm=new THREE.Group();arm.position.set(0,1.4,1.2);var armM=new THREE.Mesh(new THREE.BoxGeometry(.15,.15,1.8),stdMat(0xe11d48));armM.position.z=.9;arm.add(armM);
+var tank=new THREE.Mesh(new THREE.CylinderGeometry(.16,.16,.5,12),stdMat(0x0284c7,{metalness:.8}));tank.rotation.z=Math.PI/2;tank.position.z=1.8;arm.add(tank);rover.add(arm);arm.rotation.x=-1.3;
+var spot=new THREE.SpotLight(0xffffff,1.8,45,.7,.4,1);spot.position.set(0,1.2,1.6);spot.target.position.set(0,.4,14);rover.add(spot,spot.target);
+var glow=new THREE.PointLight(0xffe0b0,1.0,20);glow.position.set(0,3,0);rover.add(glow);
+
+/* ---------- mission state ---------- */
+var world=null,grid,known,path=[],mx,my,gx,gy,found,gasKnown,pod=null;
+var S={state:'explore',timer:0,t:0,battery:100,armT:-1.3,vit:{bpm:118,sp:88,o2:21},ch4:.4,co:12,fin:false};
+var speed=1,camMode='chase',logs=[];
+
+function log(m){var s=Math.floor(S.t),t=('0'+Math.floor(s/60)).slice(-2)+':'+('0'+s%60).slice(-2);logs.unshift('['+t+'] '+m);logs=logs.slice(0,30);document.getElementById('log').innerHTML=logs.map(function(l){return '<div>'+l+'</div>'}).join('')}
+
+function genMaze(seed){
+  var r=rng32(seed),g=[];for(var y=0;y<H;y++){g.push(new Array(W).fill(1))}
+  var st=[[1,1]];g[1][1]=0;
+  while(st.length){var c=st[st.length-1],x=c[0],y=c[1],n=[];
+    D.forEach(function(d){var a=x+d[0]*2,b=y+d[1]*2;if(a>0&&b>0&&a<W-1&&b<H-1&&g[b][a])n.push([a,b,d[0],d[1]])});
+    if(!n.length){st.pop();continue}
+    var p=n[Math.floor(r()*n.length)];g[y+p[3]][x+p[2]]=0;g[p[1]][p[0]]=0;st.push([p[0],p[1]])}
+  for(var i=0;i<16;i++){var x2=1+Math.floor(r()*(W-2)),y2=1+Math.floor(r()*(H-2));
+    if(g[y2][x2]&&((!g[y2][x2-1]&&!g[y2][x2+1])||(!g[y2-1][x2]&&!g[y2+1][x2])))g[y2][x2]=0}
+  return {g:g,r:r}}
+
+function farthest(){var seen={},q=[[1,1]],last=[1,1];seen[W+1]=1;
+  for(var i=0;i<q.length;i++){var c=q[i];last=c;D.forEach(function(d){var nx=c[0]+d[0],ny=c[1]+d[1],k=ny*W+nx;if(!grid[ny][nx]&&!seen[k]){seen[k]=1;q.push([nx,ny])}})}
+  return last}
+
+function newMission(){
+  if(world){scene.remove(world);world.traverse(function(o){if(o.geometry)o.geometry.dispose()})}
+  var seed=Math.floor(Math.random()*1e6),m=genMaze(seed);grid=m.g;
+  known=[];for(var y=0;y<H;y++)known.push(new Array(W).fill(0));
+  var f=farthest();mx=f[0];my=f[1];
+  var ends=[];for(y=1;y<H-1;y++)for(var x=1;x<W-1;x++){if(grid[y][x])continue;var n=0;D.forEach(function(d){if(!grid[y+d[1]][x+d[0]])n++});
+    if(n===1&&!(x===1&&y===1)&&!(x===mx&&y===my))ends.push([x,y])}
+  var ge=ends.length?ends[Math.floor(m.r()*ends.length)]:[W-2,1];gx=ge[0];gy=ge[1];
+  found=false;gasKnown=false;pod=null;path=[];logs=[];
+  S={state:'explore',timer:0,t:0,battery:100,armT:-1.3,vit:{bpm:118,sp:88,o2:21},ch4:.4,co:12,fin:false};
+  world=new THREE.Group();scene.add(world);
+  var fl=new THREE.Mesh(new THREE.PlaneGeometry(W*CS,H*CS),stdMat(0x243040,{roughness:.9}));fl.rotation.x=-Math.PI/2;world.add(fl);
+  var ws=[];for(y=0;y<H;y++)for(x=0;x<W;x++)if(grid[y][x])ws.push([x,y]);
+  var im=new THREE.InstancedMesh(new THREE.BoxGeometry(CS,5,CS),stdMat(0x3f4d63,{roughness:.8}),ws.length),m4=new THREE.Matrix4();
+  ws.forEach(function(p,i){m4.setPosition(wx(p[0]),2.5,wz(p[1]));im.setMatrixAt(i,m4)});world.add(im);
+  /* rails along free cells */
+  for(y=0;y<H;y++)for(x=0;x<W;x++)if(!grid[y][x]&&(x+y)%2===0){var t=new THREE.Mesh(new THREE.BoxGeometry(.3,.05,CS*.5),stdMat(0x78350f));t.position.set(wx(x),.03,wz(y));world.add(t)}
+  /* miner */
+  var mg=new THREE.Group();mg.position.set(wx(mx),0,wz(my));
+  var body=new THREE.Mesh(new THREE.CylinderGeometry(.3,.27,.95,12),stdMat(0xea580c));body.position.y=.35;body.rotation.z=Math.PI/2.3;mg.add(body);
+  var hel=new THREE.Mesh(new THREE.SphereGeometry(.26,14,14,0,Math.PI*2,0,Math.PI/2),stdMat(0xeab308));hel.position.set(.6,.55,0);mg.add(hel);
+  var hl=new THREE.PointLight(0x38bdf8,1.6,10);hl.position.y=1.2;mg.add(hl);
+  for(var i=0;i<9;i++){var rk=new THREE.Mesh(new THREE.DodecahedronGeometry(.35+Math.random()*.3),stdMat(0x1e293b,{roughness:.95}));rk.position.set((Math.random()-.5)*3.2,.3,(Math.random()-.5)*3.2);if(Math.hypot(rk.position.x,rk.position.z)<1)rk.position.x+=1.5;mg.add(rk)}
+  world.add(mg);
+  /* gas pocket */
+  var gm=new THREE.Mesh(new THREE.SphereGeometry(2.2,16,16),new THREE.MeshBasicMaterial({color:0xf59e0b,transparent:true,opacity:.22}));gm.position.set(wx(gx),1.6,wz(gy));world.add(gm);
+  rover.position.set(wx(1),0,wz(1));rover.rotation.y=0;
+  log('Rover deployed at pithead. Map unknown. Exploring...');
+  document.getElementById('alert').style.display='none';
+}
+
+/* ---------- mapping + planning ---------- */
+function cell(){return [Math.floor(rover.position.x/CS+W/2),Math.floor(rover.position.z/CS+H/2)]}
+function scan(){
+  var px=rover.position.x/CS+W/2,pz=rover.position.z/CS+H/2,c=cell();known[c[1]][c[0]]=1;
+  for(var i=0;i<72;i++){var a=i/72*6.2832,dx=Math.sin(a)*.4,dz=Math.cos(a)*.4,x=px,z=pz;
+    for(var s=0;s<20;s++){x+=dx;z+=dz;var cx=Math.floor(x),cz=Math.floor(z);
+      if(cx<0||cz<0||cx>=W||cz>=H)break;
+      if(grid[cz][cx]){known[cz][cx]=2;break}
+      known[cz][cx]=1;
+      if(!found&&cx===mx&&cz===my){found=true;path=[];S.state='explore';log('THERMAL LOCK: human signature detected!');beep(920,.2,'sawtooth');setTimeout(function(){beep(680,.2,'sawtooth')},180)}}}}
+function isFrontier(x,y){for(var i=0;i<4;i++){var nx=x+D[i][0],ny=y+D[i][1];if(nx>=0&&ny>=0&&nx<W&&ny<H&&known[ny][nx]===0)return true}return false}
+function bfs(sx,sy,goal){
+  var prev={},q=[[sx,sy]];prev[sy*W+sx]=-1;
+  for(var i=0;i<q.length;i++){var c=q[i],x=c[0],y=c[1];
+    if(goal(x,y)){var p=[],k=y*W+x;while(k!==-1){p.push([k%W,(k/W)|0]);k=prev[k]}return p.reverse()}
+    for(var j=0;j<4;j++){var nx=x+D[j][0],ny=y+D[j][1];if(nx<0||ny<0||nx>=W||ny>=H)continue;var k2=ny*W+nx;
+      if(prev[k2]!==undefined||known[ny][nx]!==1)continue;
+      if(gasKnown&&nx===gx&&ny===gy)continue;
+      prev[k2]=y*W+x;q.push([nx,ny])}}
+  return null}
+function plan(){
+  var c=cell(),p;
+  if(S.state==='return'){p=bfs(c[0],c[1],function(x,y){return x===1&&y===1});path=p||[];return}
+  if(found){p=bfs(c[0],c[1],function(x,y){return x===mx&&y===my});
+    if(p){path=p;if(S.state!=='approach'){S.state='approach';log('AI: safe route to survivor computed ('+p.length+' cells)')}return}}
+  p=bfs(c[0],c[1],isFrontier);
+  if(p){path=p}else{path=[];S.state='done';S.fin=true;log(found?'Survivor unreachable via known map.':'Search exhausted - no survivor found.')}}
+
+/* ---------- simulation step ---------- */
+function step(dt){
+  if(S.fin)return;
+  S.t+=dt;S.battery=Math.max(5,S.battery-dt*.04);
+  scan();
+  var mp=new THREE.Vector3(wx(mx),0,wz(my)),dm=rover.position.distanceTo(mp);
+  var dg=Math.hypot(rover.position.x-wx(gx),rover.position.z-wz(gy));
+  var gasLvl=Math.max(0,1-dg/9);S.ch4=+(.4+gasLvl*3.2+Math.random()*.03).toFixed(2);S.co=Math.round(12+gasLvl*45);
+  if(!gasKnown&&dg<8){gasKnown=true;path=[];log('WARNING: CH4 spike '+S.ch4+'% LEL - marking pocket as no-go, rerouting');beep(400,.3,'square')}
+
+  if(S.state==='rescue'){S.timer+=dt;
+    if(!pod&&S.timer>2.2){pod=new THREE.Mesh(new THREE.SphereGeometry(.4,12,12),new THREE.MeshBasicMaterial({color:0x38bdf8}));pod.position.set(wx(mx)+.8,.6,wz(my)+.8);world.add(pod);
+      S.vit={bpm:86,sp:98,o2:99};log('O2 life-support pod delivered. Survivor stabilised.');chime()}
+    if(S.timer>4.5){S.state='transmit';S.timer=0;log('Transmitting survivor GPS + map to surface...')}
+    return}
+  if(S.state==='transmit'){S.timer+=dt;if(S.timer>2.5){log('Extraction team dispatched to cell ['+mx+','+my+']. Returning to base.');chime();S.state='return';path=[];document.getElementById('alert').style.display='block';document.getElementById('alert').textContent='SURVIVOR LOCATED & STABILISED - RESCUE TEAM DISPATCHED'}
+    return}
+
+  if(S.state==='approach'&&dm<3.8){S.state='rescue';S.timer=0;path=[];log('Reached survivor. Deploying rescue arm.');return}
+  if(S.state==='return'){var d0=Math.hypot(rover.position.x-wx(1),rover.position.z-wz(1));if(d0<.8){S.state='done';S.fin=true;log('MISSION COMPLETE. Rover docked at pithead.');chime();return}}
+  if(!path.length){plan();if(!path.length)return}
+  var tg=path[0],tx=wx(tg[0]),tz=wz(tg[1]);
+  var dx=tx-rover.position.x,dz=tz-rover.position.z,dist=Math.hypot(dx,dz);
+  if(dist<.6){path.shift();return}
+  var want=Math.atan2(dx,dz),diff=want-rover.rotation.y;
+  while(diff>Math.PI)diff-=6.2832;while(diff<-Math.PI)diff+=6.2832;
+  var mxr=4*dt;rover.rotation.y+=Math.max(-mxr,Math.min(mxr,diff));
+  var v=Math.abs(diff)<.35?9:1.2;
+  if(dist<v*dt)v=dist/dt;
+  rover.position.x+=Math.sin(rover.rotation.y)*v*dt;rover.position.z+=Math.cos(rover.rotation.y)*v*dt;
+  wheels.forEach(function(w){w.rotation.x+=v*dt*2.2});
+}
+
+/* ---------- rendering ---------- */
+var mc=document.getElementById('map').getContext('2d'),M=11;
+function drawMap(){
+  mc.clearRect(0,0,231,231);
+  for(var y=0;y<H;y++)for(var x=0;x<W;x++){var k=known[y][x];mc.fillStyle=k===0?'#0b1220':k===1?'#1e4b5f':'#64748b';mc.fillRect(x*M,y*M,M,M)}
+  mc.fillStyle='#34d399';mc.fillRect(1*M+2,1*M+2,M-4,M-4);
+  if(gasKnown){mc.fillStyle='#f59e0b';mc.beginPath();mc.arc(gx*M+M/2,gy*M+M/2,M/2,0,6.29);mc.fill()}
+  if(found){mc.fillStyle='#f43f5e';mc.beginPath();mc.arc(mx*M+M/2,my*M+M/2,3+2*Math.sin(Date.now()/150),0,6.29);mc.fill()}
+  if(path.length){mc.strokeStyle='#22d3ee';mc.lineWidth=1.5;mc.beginPath();mc.moveTo(rover.position.x/CS*M+W*M/2,rover.position.z/CS*M+H*M/2);path.forEach(function(p){mc.lineTo(p[0]*M+M/2,p[1]*M+M/2)});mc.stroke()}
+  mc.save();mc.translate(rover.position.x/CS*M+W*M/2,rover.position.z/CS*M+H*M/2);mc.rotate(Math.PI-rover.rotation.y);
+  mc.fillStyle='#fbbf24';mc.beginPath();mc.moveTo(0,-6);mc.lineTo(4,4);mc.lineTo(-4,4);mc.closePath();mc.fill();mc.restore()}
+
+var LBL={explore:'AI EXPLORING - BUILDING MAP',approach:'APPROACHING SURVIVOR',rescue:'DEPLOYING OXYGEN POD',transmit:'TRANSMITTING COORDINATES',return:'RETURNING TO BASE',done:'MISSION ENDED'};
+var $=function(i){return document.getElementById(i)};
+function hud(){
+  var s=Math.floor(S.t);$('t').textContent=('0'+Math.floor(s/60)).slice(-2)+':'+('0'+s%60).slice(-2);
+  var kn=0;for(var y=0;y<H;y++)for(var x=0;x<W;x++)if(known[y][x])kn++;$('cov').textContent=Math.round(kn/(W*H)*100)+'%';
+  var c=cell();$('pos').textContent='['+c[0]+','+c[1]+']';
+  $('state').textContent=LBL[S.state]||S.state;
+  $('sv').textContent=found?'LOCATED @ ['+mx+','+my+']':'searching';
+  $('gas').textContent=S.ch4+'% / '+S.co+'ppm';$('gas').style.color=S.ch4>1?'#f43f5e':'';
+  $('vit').textContent=found?S.vit.bpm+' bpm / '+S.vit.sp+'%':'-';
+  $('bat').textContent=S.battery.toFixed(0)+'%'}
+
+var clock=new THREE.Clock(),fr=0;
+function loop(){
+  requestAnimationFrame(loop);
+  var dt=Math.min(clock.getDelta(),.05);
+  for(var i=0;i<speed;i++)step(dt);
+  lidar.rotation.y+=6*dt;fan.rotation.z+=2*dt;
+  S.armT+=(((S.state==='rescue'||S.state==='transmit')?0:-1.3)-S.armT)*.1;arm.rotation.x=S.armT;
+  if(pod)pod.scale.setScalar(1+.15*Math.sin(Date.now()/200));
+  var fw=new THREE.Vector3(Math.sin(rover.rotation.y),0,Math.cos(rover.rotation.y)),rp=rover.position;
+  if(camMode==='chase'){cam.position.lerp(rp.clone().addScaledVector(fw,-8).add(new THREE.Vector3(0,5.5,0)),.1);cam.lookAt(rp.clone().addScaledVector(fw,3).add(new THREE.Vector3(0,1,0)))}
+  else if(camMode==='fpv'){cam.position.copy(rp).addScaledVector(fw,.8).add(new THREE.Vector3(0,1.9,0));cam.lookAt(rp.clone().addScaledVector(fw,10).add(new THREE.Vector3(0,1.5,0)))}
+  else{cam.position.set(0,95,.01);cam.lookAt(0,0,0)}
+  rd.render(scene,cam);
+  if(++fr%4===0){drawMap();hud()}}
+
+/* ---------- controls ---------- */
+var modes=['chase','fpv','top'];
+$('bCam').onclick=function(){camMode=modes[(modes.indexOf(camMode)+1)%3];this.textContent='CAM: '+camMode.toUpperCase();scene.fog.density=camMode==='top'?.002:.012;beep(600,.05)};
+$('bSp').onclick=function(){speed=speed===1?2:speed===2?4:speed===4?8:1;this.textContent='SPEED '+speed+'x'};
+$('bLt').onclick=function(){var on=!this.classList.contains('on');this.classList.toggle('on',on);spot.intensity=on?1.8:0;glow.intensity=on?1:0};
+$('bSnd').onclick=function(){muted=!muted;this.classList.toggle('on',!muted);if(!muted)beep(700,.08)};
+$('bNew').onclick=function(){newMission()};
+
+newMission();loop();
+})();
+</script>
+</body>
+</html>
